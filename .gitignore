@@ -1,2 +1,3 @@
 .pio
 for_claude.md
+src/secrets.h

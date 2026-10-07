@@ -1,65 +1,142 @@
-
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 
+#include "secrets.h"
+#include "known_devices.h"
+#include "webpage.h"
 
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define MAX_DEVICES 30
+#define DEVICE_TIMEOUT_MS 30000UL
+#define SCAN_DURATION_SEC 3
 
-BLECharacteristic *pCharacteristic;
-bool deviceConnected = false;
-uint32_t counter = 0;
+SeenDevice devices[MAX_DEVICES];
+int deviceCount = 0;
 
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *pServer) override {
-    deviceConnected = true;
-    Serial.println("Client connected");
+bool scanning = true;
+WebServer server(80);
+BLEScan *pBLEScan;
+
+int findDeviceIndex(const String &mac) {
+  for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].mac == mac) return i;
+  }
+  return -1;
+}
+
+void upsertDevice(const String &mac, const String &name, int rssi) {
+  int idx = findDeviceIndex(mac);
+  if (idx >= 0) {
+    devices[idx].name = name;
+    devices[idx].rssi = rssi;
+    devices[idx].lastSeenMs = millis();
+    return;
   }
 
-  void onDisconnect(BLEServer *pServer) override {
-    deviceConnected = false;
-    Serial.println("Client disconnected, restarting advertising");
-    pServer->startAdvertising();
+  SeenDevice newDevice;
+  newDevice.mac = mac;
+  newDevice.name = name;
+  newDevice.rssi = rssi;
+  newDevice.lastSeenMs = millis();
+  newDevice.knownLabel = lookupKnownDevice(mac);
+
+  if (deviceCount < MAX_DEVICES) {
+    devices[deviceCount++] = newDevice;
+  } else {
+    int worstIdx = 0;
+    for (int i = 1; i < deviceCount; i++) {
+      if (devices[i].rssi < devices[worstIdx].rssi) worstIdx = i;
+    }
+    devices[worstIdx] = newDevice;
+  }
+}
+
+void ageOutDevices() {
+  unsigned long now = millis();
+  for (int i = 0; i < deviceCount;) {
+    if (now - devices[i].lastSeenMs > DEVICE_TIMEOUT_MS) {
+      devices[i] = devices[deviceCount - 1];
+      deviceCount--;
+    } else {
+      i++;
+    }
+  }
+}
+
+class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) override {
+    String mac = advertisedDevice.getAddress().toString().c_str();
+    String name = advertisedDevice.haveName()
+                      ? String(advertisedDevice.getName().c_str())
+                      : String("(unnamed)");
+    int rssi = advertisedDevice.getRSSI();
+    upsertDevice(mac, name, rssi);
   }
 };
 
+void handleRoot() {
+  server.send(200, "text/html",
+              buildDashboardHtml(devices, deviceCount, scanning, millis()));
+}
+
+void handleStart() {
+  scanning = true;
+  Serial.println("Scanning resumed");
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleStop() {
+  scanning = false;
+  Serial.println("Scanning paused");
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected, IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
 void setup() {
   Serial.begin(115200);
-  Serial.println("Starting BLE work!");
+  Serial.println("Starting BLE scanner + dashboard");
 
-  BLEDevice::init("ESP32-BLE-Demo");
-  BLEServer *pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new ServerCallbacks());
+  connectWiFi();
 
-  BLEService *pService = pServer->createService(SERVICE_UUID);
+  server.on("/", handleRoot);
+  server.on("/start", handleStart);
+  server.on("/stop", handleStop);
+  server.begin();
+  Serial.println("Web server started");
 
-  pCharacteristic = pService->createCharacteristic(
-      CHARACTERISTIC_UUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  pCharacteristic->addDescriptor(new BLE2902());
-  pCharacteristic->setValue("0");
-
-  pService->start();
-
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  BLEDevice::startAdvertising();
-
-  Serial.println("Advertising started, waiting for a client to connect...");
+  BLEDevice::init("");
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new ScanCallbacks(), true);
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
 }
 
 void loop() {
-  if (deviceConnected) {
-    counter++;
-    char buf[12];
-    snprintf(buf, sizeof(buf), "%lu", (unsigned long)counter);
-    pCharacteristic->setValue(buf);
-    pCharacteristic->notify();
-    Serial.printf("Notified value: %s\n", buf);
+  server.handleClient();
+
+  if (scanning) {
+    pBLEScan->start(SCAN_DURATION_SEC, false);
+    pBLEScan->clearResults();
+    ageOutDevices();
+  } else {
+    delay(200);
   }
-  delay(2000);
 }
